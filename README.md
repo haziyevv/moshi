@@ -22,7 +22,7 @@ There are three separate versions of the Moshi inference stack in this repo.
 
 Finally, the code for the web UI client used in the [Moshi demo](https://moshi.chat) is provided in the [`client/`](client/) directory.
 
-If you want to fine tune Moshi, head out to [kyutai-labs/moshi-finetune](https://github.com/kyutai-labs/moshi-finetune).
+If you want to fine tune Moshi, head out to [kyutai-labs/moshi-finetune](https://github.com/kyutai-labs/moshi-finetune). That repo uses the standard Moshi/Moshiko checkpoint and SentencePiece tokenizer. If you are using the **Qwen-backed Moshi** variant (this fork), see [docs/FINETUNE_QWEN_MOSHI.md](docs/FINETUNE_QWEN_MOSHI.md) instead, since the text tokenizer and vocab differ.
 
 ### Other Kyutai models
 
