@@ -5,7 +5,7 @@ description = "Moshi is moshi"
 dependencies = [
     "numpy >= 1.26, < 2.3",
     "safetensors >= 0.4.0, < 0.8.0",
-    "huggingface-hub >= 0.24, < 1.0.0",
+    "huggingface-hub >= 0.24, < 2.0.0",
     "bitsandbytes >= 0.45, < 0.50.0; sys_platform == 'linux'",
     "einops >= 0.7, < 0.9",
     "sentencepiece >= 0.2.0, < 0.3",
@@ -14,6 +14,8 @@ dependencies = [
     "torch >= 2.2.0, < 2.10",
     "aiohttp>=3.10.5, <3.12",
     "tqdm >= 4.48",
+    "transformers >= 4.37.0, < 6.0",
+    "accelerate >= 0.26.0, < 2.0",
 ]
 authors = [{name="Laurent Mazaré", email="laurent@kyutai.org"}]
 maintainers = [{name="Laurent Mazaré", email="laurent@kyutai.org"}]
@@ -26,6 +28,7 @@ moshi-server-py = "moshi.server:main"
 moshi-client-py = "moshi.client:main"
 moshi-inference = "moshi.run_inference:main"
 moshi-tts = "moshi.run_tts:main"
+moshi-qwen = "moshi.run_qwen:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "moshi.__version__"}

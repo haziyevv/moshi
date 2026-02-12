@@ -11,4 +11,5 @@ from .compression import (
     MimiModel,
 )
 from .lm import LMModel, LMGen
-from .loaders import get_mimi, get_moshi_lm
+from .loaders import get_mimi, get_moshi_lm, get_qwen_moshi_lm
+from .qwen_wrapper import QwenWrapper

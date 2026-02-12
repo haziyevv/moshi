@@ -446,6 +446,93 @@ def get_moshi_lm(
     return model
 
 
+def get_qwen_moshi_lm(
+    qwen_weights: str | Path,
+    config_path: str | Path = "configs/moshi_qwen_3b.json",
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
+) -> LMModel:
+    """Create a Moshi LMModel with Qwen 2.5-3B as the temporal transformer backbone.
+
+    This loads the backbone (transformer) weights from a converted Qwen checkpoint
+    (created by ``scripts/import_qwen_pytorch.py``). The Depformer, audio embeddings,
+    and output projection layers that don't exist in Qwen are randomly initialized
+    and will need fine-tuning.
+
+    Args:
+        qwen_weights: Path to converted Qwen safetensors file (Moshi format).
+        config_path: Path to the Moshi-Qwen config JSON.
+        device: Target device.
+        dtype: Model dtype.
+
+    Returns:
+        An ``LMModel`` with Qwen backbone weights loaded and remaining components
+        randomly initialized.
+    """
+    config_file = Path(config_path)
+    if not config_file.exists():
+        # Try relative to the repo root
+        import importlib
+        pkg_dir = Path(importlib.util.find_spec("moshi").origin).parent.parent.parent  # type: ignore
+        config_file = pkg_dir / config_path
+    with open(config_file) as f:
+        lm_kwargs = json.load(f)
+
+    lm_kwargs = dict(lm_kwargs)
+
+    if "conditioners" in lm_kwargs:
+        lm_kwargs["condition_provider"] = get_conditioner_provider(
+            lm_kwargs["dim"], device, lm_kwargs
+        )
+        del lm_kwargs["conditioners"]
+    if lm_kwargs.get("fuser", None) is not None:
+        lm_kwargs["fuser"] = get_condition_fuser(lm_kwargs)
+
+    # deprecated params.
+    lm_kwargs.pop("depformer_causal", None)
+    if 'demux_second_stream' in lm_kwargs:
+        lm_kwargs['demux_second_text_stream'] = lm_kwargs.pop('demux_second_stream')
+
+    # Build model on real device (random init), then overwrite with Qwen backbone weights.
+    model = LMModel(device=device, dtype=dtype, **lm_kwargs)
+
+    # Load converted Qwen backbone weights.
+    qwen_state = load_file(str(qwen_weights), device=str(device))
+    for key, value in qwen_state.items():
+        if value.dtype.is_floating_point:
+            value = value.to(dtype)
+        qwen_state[key] = value
+
+    # Handle text_emb: Moshi adds +1 for special token, Qwen doesn't have it.
+    # Pad the embedding with a small random vector for the extra token.
+    model_state = model.state_dict()
+    if "text_emb.weight" in qwen_state and "text_emb.weight" in model_state:
+        qwen_emb = qwen_state["text_emb.weight"]
+        model_emb = model_state["text_emb.weight"]
+        if qwen_emb.shape[0] < model_emb.shape[0]:
+            extra_rows = model_emb.shape[0] - qwen_emb.shape[0]
+            pad = torch.randn(extra_rows, qwen_emb.shape[1], device=device, dtype=dtype) * 0.02
+            qwen_state["text_emb.weight"] = torch.cat([qwen_emb, pad], dim=0)
+
+    # Load what we can from Qwen (strict=False to allow missing Depformer/audio keys).
+    result = model.load_state_dict(qwen_state, strict=False, assign=True)
+
+    loaded_keys = set(model_state.keys()) - set(result.missing_keys)
+    print(
+        f"[get_qwen_moshi_lm] Loaded {len(loaded_keys)} tensors from Qwen, "
+        f"{len(result.missing_keys)} remain randomly initialized "
+        f"(Depformer/audio components need fine-tuning)."
+    )
+    if result.unexpected_keys:
+        warnings.warn(
+            f"Qwen checkpoint had {len(result.unexpected_keys)} unexpected keys: "
+            f"{result.unexpected_keys[:5]}..."
+        )
+
+    model.eval()
+    return model
+
+
 def get_conditioner(
     output_dim: int, device: torch.device | str, conditioner_cfg: dict
 ) -> BaseConditioner:
