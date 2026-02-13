@@ -1,7 +1,8 @@
 {
     "dim": 2048,
-    "text_card": 151936,
-    "existing_text_padding_id": 3,
+    "text_card": 151665,
+    "existing_text_padding_id": 151643,
+    "existing_text_end_padding_id": 151645,
     "n_q": 16,
     "dep_q": 8,
     "card": 2048,
@@ -20,7 +21,6 @@
     "depformer_dim_feedforward": 4224,
     "depformer_num_heads": 16,
     "depformer_num_layers": 6,
-    "depformer_causal": true,
     "depformer_layer_scale": null,
     "depformer_multi_linear": true,
     "depformer_context": 8,
