@@ -86,16 +86,21 @@ def parse_args():
                         "When set, backbone trains at this LR while Depformer/audio use --lr.")
     p.add_argument("--lora-rank", type=int, default=0)
 
-    # Regularization (critical to prevent overfitting / exposure bias)
-    p.add_argument("--label-smoothing", type=float, default=0.1,
-                   help="Label smoothing for cross-entropy (0.0 = none, 0.1 = recommended)")
-    p.add_argument("--audio-noise-ratio", type=float, default=0.15,
-                   help="Fraction of audio codes to randomly replace in input (0.0 = off). "
-                        "Prevents overfitting to exact sequences and reduces exposure bias.")
+    # Loss weighting (following official moshi-finetune)
+    p.add_argument("--first-codebook-weight", type=float, default=100.0,
+                   help="Weight multiplier for first audio codebook (semantic). "
+                        "Official moshi-finetune uses 100.0.")
+    p.add_argument("--text-padding-weight", type=float, default=0.5,
+                   help="Weight multiplier for text padding tokens (EOS/END). "
+                        "Official moshi-finetune uses 0.5 to avoid model just predicting padding.")
+
+    # Regularization
+    p.add_argument("--label-smoothing", type=float, default=0.0,
+                   help="Label smoothing for cross-entropy (0.0 = none)")
+    p.add_argument("--audio-noise-ratio", type=float, default=0.0,
+                   help="Fraction of audio codes to randomly replace in input (0.0 = off).")
     p.add_argument("--text-noise-ratio", type=float, default=0.0,
                    help="Fraction of text codes to randomly replace in input (usually keep at 0).")
-    p.add_argument("--dropout", type=float, default=0.1,
-                   help="Dropout applied to audio embeddings during training")
 
     # Data
     p.add_argument("--synthetic", action="store_true")
@@ -207,8 +212,13 @@ def inject_noise(codes, model, audio_noise_ratio=0.0, text_noise_ratio=0.0):
 
 
 def compute_loss(model, codes, label_smoothing=0.0, audio_noise_ratio=0.0,
-                 text_noise_ratio=0.0, condition_tensors=None):
-    """Compute text + audio cross-entropy loss with optional regularization.
+                 text_noise_ratio=0.0, condition_tensors=None,
+                 first_codebook_weight=100.0, text_padding_weight=0.5):
+    """Compute text + audio cross-entropy loss with per-codebook and text padding weighting.
+
+    Following the official moshi-finetune approach:
+    - First audio codebook gets `first_codebook_weight` multiplier (default 100x)
+    - Text padding tokens (EOS/END) get `text_padding_weight` multiplier (default 0.5x)
 
     Returns (total_loss, text_loss, audio_loss).
     """
@@ -216,37 +226,45 @@ def compute_loss(model, codes, label_smoothing=0.0, audio_noise_ratio=0.0,
     noisy_codes = inject_noise(codes, model, audio_noise_ratio, text_noise_ratio)
     out = model(noisy_codes, condition_tensors=condition_tensors)
 
-    # Targets are always the clean codes
     text_loss = torch.tensor(0.0, device=model.device, dtype=torch.float32)
     audio_loss = torch.tensor(0.0, device=model.device, dtype=torch.float32)
 
+    # --- Text loss with padding down-weighting ---
     if out.text_logits is not None and out.text_mask is not None:
+        text_targets = codes[:, :1, :]  # [B, 1, T]
         text_ce = cross_entropy(
-            out.text_logits, codes[:, :1, :], out.text_mask,
+            out.text_logits, text_targets, out.text_mask,
             dtype=torch.float32, logits_soft_clip=30.0,
         )
         if out.text_mask.any():
-            text_loss = text_ce[out.text_mask].mean()
-            # Label smoothing: add uniform distribution penalty
-            if label_smoothing > 0:
-                # Approximate smoothing: penalize low-entropy predictions
-                n_classes = out.text_logits.shape[-1]
-                smooth_penalty = -torch.log(torch.tensor(1.0 / n_classes, device=model.device))
-                text_loss = (1 - label_smoothing) * text_loss + label_smoothing * smooth_penalty
+            # Build per-position weights: 1.0 for real text, text_padding_weight for padding
+            text_weights = out.text_mask.float()  # [B, 1, T]
+            if text_padding_weight != 1.0:
+                padding_id = model.existing_text_padding_id
+                end_padding_id = model.existing_text_end_padding_id
+                is_padding = (text_targets == padding_id) | (text_targets == end_padding_id)
+                text_weights = torch.where(is_padding & out.text_mask,
+                                           text_weights * text_padding_weight,
+                                           text_weights)
+            # Weighted mean
+            weighted_ce = text_ce * text_weights
+            text_loss = weighted_ce.sum() / text_weights.sum().clamp(min=1.0)
 
+    # --- Audio loss with first codebook upweighting ---
     if out.logits is not None and out.mask is not None:
+        audio_targets = codes[:, model.audio_offset:model.audio_offset + model.dep_q, :]
         audio_ce = cross_entropy(
-            out.logits,
-            codes[:, model.audio_offset : model.audio_offset + model.dep_q, :],
-            out.mask,
+            out.logits, audio_targets, out.mask,
             dtype=torch.float32, logits_soft_clip=30.0,
         )
         if out.mask.any():
-            audio_loss = audio_ce[out.mask].mean()
-            if label_smoothing > 0:
-                n_classes = out.logits.shape[-1]
-                smooth_penalty = -torch.log(torch.tensor(1.0 / n_classes, device=model.device))
-                audio_loss = (1 - label_smoothing) * audio_loss + label_smoothing * smooth_penalty
+            # Build per-codebook weights: first codebook gets higher weight
+            audio_weights = out.mask.float()  # [B, dep_q, T]
+            if first_codebook_weight != 1.0:
+                audio_weights[:, 0, :] = audio_weights[:, 0, :] * first_codebook_weight
+            # Weighted mean
+            weighted_ce = audio_ce * audio_weights
+            audio_loss = weighted_ce.sum() / audio_weights.sum().clamp(min=1.0)
 
     total_loss = text_loss + audio_loss
     return total_loss, text_loss, audio_loss
@@ -419,6 +437,8 @@ def main():
                 label_smoothing=args.label_smoothing,
                 audio_noise_ratio=args.audio_noise_ratio,
                 text_noise_ratio=args.text_noise_ratio,
+                first_codebook_weight=args.first_codebook_weight,
+                text_padding_weight=args.text_padding_weight,
             )
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.max_grad_norm)
@@ -447,6 +467,8 @@ def main():
                     label_smoothing=args.label_smoothing,
                     audio_noise_ratio=args.audio_noise_ratio,
                     text_noise_ratio=args.text_noise_ratio,
+                    first_codebook_weight=args.first_codebook_weight,
+                    text_padding_weight=args.text_padding_weight,
                 )
                 scaled_loss = loss / args.grad_accum
                 scaled_loss.backward()

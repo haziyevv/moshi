@@ -366,13 +366,15 @@ class LMModel(StreamingContainer):
         logits = self.forward_depformer_training(delayed_codes[:, :, 1:], transformer_out)
 
         # map back the logits on pattern sequence to logits on original codes: [B, K, S, card] -> [B, K, T, card]
-        # and provide the corresponding mask over invalid positions of tokens. We will with NaN values invalid positions
-        # to ensure they properly handled.
+        # and provide the corresponding mask over invalid positions of tokens.
+        # Using fill_value=0.0 instead of NaN to avoid potential NaN gradient
+        # contamination through logsumexp backward (IEEE 754: 0 * NaN = NaN).
+        # The mask is the authoritative source for valid positions.
         logits, logits_mask = _undelay_sequence(
             self.delays[self.audio_offset:self.audio_offset + self.dep_q],
-            logits, fill_value=float('NaN'))
+            logits, fill_value=0.0)
         logits_mask &= (codes[:, self.audio_offset: self.audio_offset + self.dep_q] != self.zero_token_id)
-        text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=float('NaN'))
+        text_logits, text_logits_mask = _undelay_sequence(self.delays[:1], text_logits, fill_value=0.0)
         text_logits_mask &= (codes[:, :1] != self.zero_token_id)
         return LMOutput(logits, logits_mask, text_logits, text_logits_mask)
 
@@ -571,6 +573,8 @@ class LMGen(StreamingModule[_LMGenState]):
         support_out_of_sync: bool = False,
         cfg_is_masked_until: list[int] | None = None,
         cfg_is_no_text: bool = False,
+        repetition_penalty: float = 1.0,
+        repetition_penalty_window: int = 20,
     ):
         assert not lm_model.training, "generation shouldn't be used in training mode."
         super().__init__()
@@ -584,6 +588,10 @@ class LMGen(StreamingModule[_LMGenState]):
         self.top_k_text = top_k_text
         self.cfg_coef = cfg_coef
         self.check = check
+        self.repetition_penalty = repetition_penalty
+        self.repetition_penalty_window = repetition_penalty_window
+        # Track recently generated audio tokens for repetition penalty
+        self._recent_audio_tokens: list[torch.Tensor] = []
         self.max_delay = max(
             lm_model.delays
         )  # with delays, we need to generate a few more time steps.
@@ -603,6 +611,7 @@ class LMGen(StreamingModule[_LMGenState]):
                 assert self.condition_tensors, "Missing condition tensors for CFG."
 
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
+        self._recent_audio_tokens = []  # Reset repetition penalty history
         lm_model = self.lm_model
         initial = lm_model._get_initial_token()
         cache = torch.full(
@@ -820,6 +829,14 @@ class LMGen(StreamingModule[_LMGenState]):
         depformer_tokens: list[torch.Tensor] = []
         assert lm_model.depformer
         assert not lm_model.depformer.is_streaming
+
+        # Build previous_tokens tensor for repetition penalty from recent history
+        prev_tokens_for_penalty = None
+        if self.repetition_penalty != 1.0 and self._recent_audio_tokens:
+            prev_tokens_for_penalty = torch.stack(
+                self._recent_audio_tokens[-self.repetition_penalty_window:], dim=-1
+            )  # [B, dep_q, window]
+
         with lm_model.depformer.streaming(B_cfg):
             assert lm_model.depformer.is_streaming
             for cb_index in range(lm_model.dep_q):
@@ -830,11 +847,17 @@ class LMGen(StreamingModule[_LMGenState]):
                 if self.cfg_coef != 1.:
                     logits, logits_null = logits.chunk(2)
                     logits = logits_null + (logits - logits_null) * self.cfg_coef
+                # Extract per-codebook previous tokens for penalty
+                cb_prev = None
+                if prev_tokens_for_penalty is not None:
+                    cb_prev = prev_tokens_for_penalty[:, cb_index, :]  # [B, window]
                 next_token = sample_token(
                     logits.float(),
                     self.use_sampling,
                     self.temp,
                     self.top_k,
+                    previous_tokens=cb_prev,
+                    repetition_penalty=self.repetition_penalty,
                 )
                 assert next_token.shape == (B, 1, 1)
                 next_token = next_token[:, 0, 0]  # shape is B
@@ -847,4 +870,11 @@ class LMGen(StreamingModule[_LMGenState]):
         )
         out = torch.stack(depformer_tokens, dim=1)
         assert out.shape == (B, lm_model.dep_q), out.shape
+
+        # Track for future repetition penalty
+        if self.repetition_penalty != 1.0:
+            self._recent_audio_tokens.append(out.detach())
+            if len(self._recent_audio_tokens) > self.repetition_penalty_window:
+                self._recent_audio_tokens.pop(0)
+
         return out

@@ -84,6 +84,10 @@ def main():
     parser.add_argument("--temp-text", type=float, default=0.7)
     parser.add_argument("--top-k", type=int, default=250)
     parser.add_argument("--top-k-text", type=int, default=25)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0,
+                        help="Repetition penalty for audio tokens (1.0=off, 1.3=moderate, 2.0=strong)")
+    parser.add_argument("--repetition-window", type=int, default=20,
+                        help="Number of recent frames to consider for repetition penalty")
     args = parser.parse_args()
 
     config_path = args.config or str(REPO_ROOT / "configs" / "moshi_qwen_3b.json")
@@ -114,6 +118,8 @@ def main():
         temp_text=args.temp_text,
         top_k=args.top_k,
         top_k_text=args.top_k_text,
+        repetition_penalty=args.repetition_penalty,
+        repetition_penalty_window=args.repetition_window,
     )
 
     # --- Load input audio ---

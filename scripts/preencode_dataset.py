@@ -75,6 +75,7 @@ def build_text_stream(
     to_append: deque = deque()
     last_word_end = -1
     alignment_idx = 0
+    is_new_word = False
 
     for t in range(T):
         # Consume alignments whose start falls before frame t+1
@@ -86,17 +87,21 @@ def build_text_stream(
             word_start, word_end = alignments[alignment_idx][1]
             last_word_end = int(word_end * frame_rate)
 
-            # Tokenize with Qwen tokenizer
+            # Tokenize with Qwen tokenizer — extend (not replace) to preserve
+            # tokens from earlier words that haven't been placed yet.
             tokens = tokenizer.encode(word, add_special_tokens=False)
-            to_append = deque(tokens)
+            to_append.extend(tokens)
+            if tokens:
+                is_new_word = True
             alignment_idx += 1
 
         if to_append:
             # Mark end-of-padding before the first token of a new word
-            if t > 0 and text_tokens[t - 1] == text_padding_id:
+            if is_new_word and t > 0 and text_tokens[t - 1] == text_padding_id:
                 text_tokens[t - 1] = end_of_text_padding_id
             text_tokens[t] = to_append.popleft()
-        elif t <= last_word_end:
+            is_new_word = False
+        elif t < last_word_end:
             # Within a word boundary but no tokens left: use padding
             text_tokens[t] = text_padding_id
 
