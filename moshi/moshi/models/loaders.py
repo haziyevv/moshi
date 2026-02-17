@@ -503,9 +503,8 @@ def get_qwen_moshi_lm(
             value = value.to(dtype)
         qwen_state[key] = value
 
-    # Handle text_emb: resize to match model's expected size.
-    # - If checkpoint has fewer rows: pad with small random vectors
-    # - If checkpoint has more rows: truncate to model size
+    # Handle text_emb: Moshi adds +1 for special token, Qwen doesn't have it.
+    # Pad the embedding with a small random vector for the extra token.
     model_state = model.state_dict()
     if "text_emb.weight" in qwen_state and "text_emb.weight" in model_state:
         qwen_emb = qwen_state["text_emb.weight"]
@@ -514,16 +513,6 @@ def get_qwen_moshi_lm(
             extra_rows = model_emb.shape[0] - qwen_emb.shape[0]
             pad = torch.randn(extra_rows, qwen_emb.shape[1], device=device, dtype=dtype) * 0.02
             qwen_state["text_emb.weight"] = torch.cat([qwen_emb, pad], dim=0)
-        elif qwen_emb.shape[0] > model_emb.shape[0]:
-            # Truncate to model size (checkpoint has more tokens than needed)
-            qwen_state["text_emb.weight"] = qwen_emb[:model_emb.shape[0]]
-
-    # Same handling for text_linear (output projection)
-    if "text_linear.weight" in qwen_state and "text_linear.weight" in model_state:
-        qwen_lin = qwen_state["text_linear.weight"]
-        model_lin = model_state["text_linear.weight"]
-        if qwen_lin.shape[0] > model_lin.shape[0]:
-            qwen_state["text_linear.weight"] = qwen_lin[:model_lin.shape[0]]
 
     # Load what we can from Qwen (strict=False to allow missing Depformer/audio keys).
     result = model.load_state_dict(qwen_state, strict=False, assign=True)
@@ -539,6 +528,22 @@ def get_qwen_moshi_lm(
             f"Qwen checkpoint had {len(result.unexpected_keys)} unexpected keys: "
             f"{result.unexpected_keys[:5]}..."
         )
+
+    # Initialize audio codebook embeddings near zero so that the transformer input
+    # starts as mostly text_emb (which Qwen understands). The audio embeddings will
+    # grow from near-zero during training as the model learns to use them.
+    # Only do this for fresh Qwen weights (where Depformer/audio keys are missing).
+    # If loading a fully-trained checkpoint, skip scaling to preserve learned weights.
+    if result.missing_keys:
+        with torch.no_grad():
+            for emb in model.emb:
+                emb.weight.data.mul_(0.01)
+            print(
+                f"[get_qwen_moshi_lm] Scaled {len(model.emb)} audio embeddings to 0.01x "
+                f"(preserving Qwen's text pathway at init)."
+            )
+    else:
+        print("[get_qwen_moshi_lm] Full checkpoint detected, skipping audio embedding scaling.")
 
     model.eval()
     return model
