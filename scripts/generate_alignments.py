@@ -24,77 +24,8 @@ import os
 from pathlib import Path
 
 import numpy as np
-import torch
-import torchaudio
 
 WHISPER_SR = 16_000
-
-
-def get_speech_mask(audio: np.ndarray, sr: int,
-                    frame_sec: float = 0.025,
-                    energy_threshold_db: float = -40.0) -> list[tuple[float, float]]:
-    """Return list of (start_sec, end_sec) intervals where audio has speech energy.
-
-    Uses a simple energy-based VAD: split audio into short frames,
-    compute RMS, mark frames above threshold, then merge adjacent
-    active frames into intervals with a small collar.
-    """
-    frame_len = int(frame_sec * sr)
-    if frame_len == 0:
-        return [(0.0, len(audio) / sr)]
-
-    n_frames = len(audio) // frame_len
-    if n_frames == 0:
-        return []
-
-    # Compute per-frame RMS in dB
-    frames = audio[:n_frames * frame_len].reshape(n_frames, frame_len)
-    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-10)
-    rms_db = 20 * np.log10(rms + 1e-10)
-
-    # Mark active frames
-    active = rms_db > energy_threshold_db
-
-    # Merge into intervals with 0.3s collar (merge gaps < 0.3s)
-    collar_frames = int(0.3 / frame_sec)
-    intervals: list[tuple[float, float]] = []
-    i = 0
-    while i < n_frames:
-        if active[i]:
-            start = i
-            end = i
-            while i < n_frames:
-                if active[i]:
-                    end = i
-                    i += 1
-                else:
-                    # Look ahead for collar
-                    gap_start = i
-                    while i < n_frames and not active[i] and (i - gap_start) < collar_frames:
-                        i += 1
-                    if i < n_frames and active[i]:
-                        continue  # merged gap
-                    else:
-                        break
-            intervals.append((
-                start * frame_sec,
-                (end + 1) * frame_sec,
-            ))
-        else:
-            i += 1
-
-    return intervals
-
-
-def word_in_speech_region(word_start: float, word_end: float,
-                          speech_intervals: list[tuple[float, float]],
-                          tolerance: float = 0.15) -> bool:
-    """Check if a word's midpoint falls within a speech interval (with tolerance)."""
-    word_mid = (word_start + word_end) / 2
-    for s, e in speech_intervals:
-        if (s - tolerance) <= word_mid <= (e + tolerance):
-            return True
-    return False
 
 
 def main():
@@ -165,11 +96,10 @@ def main():
             # Left channel = main speaker
             left_channel = wav_data[0].astype(np.float32)
 
-            # Detect speech regions on the left channel to filter hallucinations
-            speech_intervals = get_speech_mask(left_channel, sr)
-
-            # Resample to 16kHz — faster-whisper assumes numpy arrays are 16kHz
+            # Resample to 16kHz if needed — faster-whisper assumes numpy arrays are 16kHz
             if sr != WHISPER_SR:
+                import torch
+                import torchaudio
                 audio_16k = torchaudio.functional.resample(
                     torch.from_numpy(left_channel).unsqueeze(0),
                     orig_freq=sr, new_freq=WHISPER_SR,
@@ -183,28 +113,19 @@ def main():
                 language=args.language,
                 word_timestamps=True,
                 beam_size=5,
-                condition_on_previous_text=False,
+                vad_filter=True,
             )
 
-            # Collect word-level alignments, filtering out words in silent regions
+            # Collect word-level alignments (keep all words, no filtering)
             alignments = []
-            n_filtered = 0
             for segment in segments:
                 if segment.words:
                     for word_info in segment.words:
-                        w_start = round(word_info.start, 3)
-                        w_end = round(word_info.end, 3)
-                        if word_in_speech_region(w_start, w_end, speech_intervals):
-                            alignments.append([
-                                word_info.word.strip(),
-                                [w_start, w_end],
-                                "SPEAKER_MAIN"
-                            ])
-                        else:
-                            n_filtered += 1
-
-            if n_filtered > 0:
-                print(f"  {wav_path.name}: filtered {n_filtered} hallucinated words in silent regions")
+                        alignments.append([
+                            word_info.word.strip(),
+                            [round(word_info.start, 3), round(word_info.end, 3)],
+                            "SPEAKER_MAIN"
+                        ])
 
             # Save alignment JSON
             with open(json_path, "w") as f:

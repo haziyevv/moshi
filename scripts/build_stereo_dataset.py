@@ -39,6 +39,13 @@ Usage::
         --out-dir ./stereo-dataset \\
         --text-alignments
 
+    # Best: forced alignment with MFA — activate conda then venv, then run:
+    #   eval \"$(~/miniconda3/bin/conda shell.bash hook)\"
+    #   conda activate aligner
+    #   source venv/bin/activate
+    #   python scripts/build_stereo_dataset.py --dialogues-dir ./dialogues \\
+    #       --out-dir ./stereo-dataset --mfa-align
+
 Output structure::
 
     stereo-dataset/
@@ -251,6 +258,163 @@ def generate_alignment_from_text(turn_info: list[dict]) -> list:
     return alignments
 
 
+def _parse_mfa_textgrid(tg_path: str, our_words: list[str],
+                        offset: float) -> list | None:
+    """Parse an MFA TextGrid and return word alignments with global offset.
+
+    Returns None if the TextGrid can't be parsed or word count doesn't match.
+    """
+    from praatio import textgrid
+
+    tg = textgrid.openTextgrid(tg_path, includeEmptyIntervals=True)
+    words_tier = tg.getTier("words")
+
+    intervals = [
+        (e.start, e.end)
+        for e in words_tier
+        if e.label and e.label.strip()
+    ]
+    intervals.sort(key=lambda x: x[0])
+
+    if len(intervals) != len(our_words):
+        return None
+
+    return [
+        [word, [round(offset + s, 3), round(offset + e, 3)], "SPEAKER_MAIN"]
+        for word, (s, e) in zip(our_words, intervals)
+    ]
+
+
+def _text_fallback_alignment(turn: dict) -> list:
+    """Proportional character-length alignment as fallback."""
+    words = turn["text"].strip().split()
+    if not words:
+        return []
+    duration = turn["end_sec"] - turn["start_sec"]
+    if duration <= 0:
+        return []
+    char_counts = [max(len(w), 1) for w in words]
+    total_chars = sum(char_counts)
+    pos = turn["start_sec"]
+    aligns = []
+    for j, word in enumerate(words):
+        word_dur = duration * char_counts[j] / total_chars
+        aligns.append([word, [round(pos, 3), round(pos + word_dur, 3)], "SPEAKER_MAIN"])
+        pos += word_dur
+    return aligns
+
+
+def run_mfa_batch(
+    all_records: list[dict],
+    mfa_cmd: str = "mfa",
+    mfa_dict: str = "english_us_arpa",
+    mfa_acoustic: str = "english_mfa",
+    num_jobs: int = 4,
+) -> None:
+    """Run MFA once on all dialogues and write alignment JSONs.
+
+    *all_records* is a list of dicts, each with:
+        dialogue_dir, turn_info, output_idx, json_path
+
+    Runs ``mfa align`` using *mfa_cmd* (default "mfa" from PATH).
+    Call this script with conda env 'aligner' activated so ``mfa`` is on PATH.
+    """
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    corpus_dir = Path(tempfile.mkdtemp(prefix="mfa_corpus_"))
+    output_dir = Path(tempfile.mkdtemp(prefix="mfa_output_"))
+
+    # Map: (output_idx, turn_idx) -> (turn dict, json_path)
+    turn_map: dict[str, tuple[dict, Path, list[dict]]] = {}
+
+    print(f"  Preparing MFA corpus ({len(all_records)} dialogues)...")
+    for rec in all_records:
+        dialogue_dir: Path = rec["dialogue_dir"]
+        turn_info: list[dict] = rec["turn_info"]
+        out_idx: int = rec["output_idx"]
+        session_name = f"dlg_{out_idx:06d}"
+        session_dir = corpus_dir / session_name
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        main_turns = [t for t in turn_info if t["role"] == "main"]
+        for turn in main_turns:
+            turn_idx = turn["turn_idx"]
+            src_wav = dialogue_dir / f"turn_{turn_idx:02d}.wav"
+            if not src_wav.exists():
+                continue
+            utt_name = f"turn_{turn_idx:02d}"
+            dst_wav = session_dir / f"{utt_name}.wav"
+            dst_lab = session_dir / f"{utt_name}.lab"
+            try:
+                os.link(src_wav, dst_wav)
+            except OSError:
+                shutil.copy2(src_wav, dst_wav)
+            dst_lab.write_text(turn["text"].strip(), encoding="utf-8")
+
+        turn_map[session_name] = (rec["json_path"], main_turns)
+
+    n_utterances = sum(
+        len([t for t in rec["turn_info"] if t["role"] == "main"])
+        for rec in all_records
+    )
+    print(f"  MFA corpus ready: {len(all_records)} sessions, {n_utterances} utterances")
+    print(f"  Running MFA align (this may take a while)...")
+
+    try:
+        cmd = [
+            mfa_cmd, "align",
+            str(corpus_dir),
+            mfa_dict,
+            mfa_acoustic,
+            str(output_dir),
+            "--clean",
+            "-j", str(num_jobs),
+            "--single_speaker",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        if result.returncode != 0:
+            print(f"  WARNING: MFA returned exit code {result.returncode}")
+            if result.stderr:
+                for line in result.stderr.strip().split("\n")[-10:]:
+                    print(f"    {line}")
+
+        print("  MFA finished. Parsing TextGrids...")
+
+        n_mfa_ok = 0
+        n_fallback = 0
+        for session_name, (json_path, main_turns) in turn_map.items():
+            alignments: list[list] = []
+            for turn in main_turns:
+                turn_idx = turn["turn_idx"]
+                tg_path = output_dir / session_name / f"turn_{turn_idx:02d}.TextGrid"
+                our_words = turn["text"].strip().split()
+                offset = turn["start_sec"]
+
+                parsed = None
+                if tg_path.exists():
+                    parsed = _parse_mfa_textgrid(str(tg_path), our_words, offset)
+
+                if parsed is not None:
+                    alignments.extend(parsed)
+                    n_mfa_ok += 1
+                else:
+                    alignments.extend(_text_fallback_alignment(turn))
+                    n_fallback += 1
+
+            with open(json_path, "w") as f:
+                json.dump({"alignments": alignments}, f)
+
+        print(f"  Alignments written: {n_mfa_ok} turns via MFA, "
+              f"{n_fallback} turns via text fallback")
+
+    finally:
+        shutil.rmtree(corpus_dir, ignore_errors=True)
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+
 def save_wav(path: str, stereo: np.ndarray, sample_rate: int):
     """Save a stereo numpy array [2, samples] to WAV."""
     import soundfile as sf
@@ -288,6 +452,16 @@ def main():
     parser.add_argument("--text-alignments", action="store_true",
                         help="Generate approximate alignments from text timing "
                              "(no Whisper needed, less accurate)")
+    parser.add_argument("--mfa-align", action="store_true",
+                        help="Generate forced alignments with MFA; run with "
+                             "conda activate aligner then source venv/bin/activate")
+    parser.add_argument("--mfa-cmd", type=str,
+                        default=str(Path.home() / "miniconda3" / "envs" / "aligner" / "bin" / "mfa"),
+                        help="Path to MFA binary (default: conda aligner env; avoids venv's broken mfa)")
+    parser.add_argument("--mfa-dict", type=str, default="english_us_arpa",
+                        help="MFA dictionary model name")
+    parser.add_argument("--mfa-acoustic", type=str, default="english_mfa",
+                        help="MFA acoustic model name")
     parser.add_argument("--language", type=str, default="en",
                         help="Language for Whisper transcription")
 
@@ -335,7 +509,10 @@ def main():
     n_truncated = 0
     total_duration = 0.0
     manifest_entries = []
+    mfa_records: list[dict] = []
 
+    # --- Phase 1: build stereo WAVs + collect metadata ---
+    print("Phase 1: building stereo WAVs...")
     for di, dialogue_dir in enumerate(dialogue_dirs):
         with open(dialogue_dir / "dialogue.json") as f:
             dialogue = json.load(f)
@@ -362,7 +539,6 @@ def main():
             duration = args.max_duration
             n_truncated += 1
 
-        # Output file paths
         file_name = f"{output_idx:06d}"
         wav_path = out_dir / f"{file_name}.wav"
         json_path = out_dir / f"{file_name}.json"
@@ -371,7 +547,7 @@ def main():
             output_idx += 1
             continue
 
-        # Generate alignments
+        # Generate non-MFA alignments inline
         if args.generate_alignments and whisper_model is not None:
             alignments = generate_alignment_whisper(
                 stereo, whisper_model, args.language,
@@ -379,15 +555,23 @@ def main():
             )
         elif args.text_alignments:
             alignments = generate_alignment_from_text(turn_info)
+        elif args.mfa_align:
+            alignments = None  # deferred to Phase 2
         else:
             alignments = []
 
-        # Save stereo WAV
         save_wav(str(wav_path), stereo, args.target_sr)
 
-        # Save alignment JSON
-        with open(json_path, "w") as f:
-            json.dump({"alignments": alignments}, f)
+        if alignments is not None:
+            with open(json_path, "w") as f:
+                json.dump({"alignments": alignments}, f)
+        else:
+            mfa_records.append({
+                "dialogue_dir": dialogue_dir,
+                "turn_info": turn_info,
+                "output_idx": output_idx,
+                "json_path": json_path,
+            })
 
         total_duration += duration
         manifest_entries.append({
@@ -397,10 +581,23 @@ def main():
 
         output_idx += 1
 
-        if (di + 1) % 50 == 0:
+        if (di + 1) % 200 == 0:
             print(f"  Processed {di+1}/{len(dialogue_dirs)} dialogues -> "
                   f"{output_idx} output files, {total_duration/60:.1f} min, "
                   f"skipped {n_skipped}, failed {n_failed}")
+
+    print(f"  Phase 1 done: {output_idx} stereo WAVs "
+          f"({total_duration/60:.0f} min total)")
+
+    # --- Phase 2: batch MFA alignment ---
+    if mfa_records:
+        print(f"\nPhase 2: running MFA forced alignment on {len(mfa_records)} dialogues...")
+        run_mfa_batch(
+            mfa_records,
+            mfa_cmd=args.mfa_cmd,
+            mfa_dict=args.mfa_dict,
+            mfa_acoustic=args.mfa_acoustic,
+        )
 
     # Write manifest
     manifest_path = out_dir / "manifest.jsonl"

@@ -175,7 +175,11 @@ def main():
                         help="One or more directories containing .wav + .json pairs")
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--config", type=str, default=None,
-                        help="Path to moshi_qwen_3b.json (for padding token id)")
+                        help="Path to model config JSON (default: moshi_qwen_7b.json); "
+                             "must match the model you train with (padding ids, vocab).")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="HuggingFace tokenizer name (e.g. Qwen/Qwen2.5-3B or Qwen/Qwen2.5-7B). "
+                             "If unset, inferred from --config (7b -> Qwen2.5-7B, else Qwen2.5-3B).")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max-files", type=int, default=0,
                         help="Limit number of files (0 = no limit)")
@@ -183,8 +187,8 @@ def main():
                         help="Skip files where left channel RMS is below this threshold")
     args = parser.parse_args()
 
-    # Load config for padding id
-    config_path = args.config or str(REPO_ROOT / "configs" / "moshi_qwen_3b.json")
+    # Load config for padding id (must match the model you train with)
+    config_path = args.config or str(REPO_ROOT / "configs" / "moshi_qwen_7b.json")
     with open(config_path) as f:
         config = json.load(f)
     padding_id = config["existing_text_padding_id"]
@@ -202,7 +206,7 @@ def main():
     # Load Qwen tokenizer
     print("Loading Qwen tokenizer...")
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-3B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B", trust_remote_code=True)
     print(f"  Tokenizer vocab size: {tokenizer.vocab_size}")
 
     # Collect all WAV/JSON pairs from all data directories
