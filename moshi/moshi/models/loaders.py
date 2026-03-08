@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import warnings
 from huggingface_hub import hf_hub_download
+import moshi as _moshi_pkg
 
 try:
     from huggingface_hub.errors import EntryNotFoundError
@@ -474,7 +475,10 @@ def get_qwen_moshi_lm(
     if not config_file.exists():
         # Try relative to the repo root
         import importlib
-        pkg_dir = Path(importlib.util.find_spec("moshi").origin).parent.parent.parent  # type: ignore
+        #pkg_dir = Path(_moshi_pkg.__file__).parent.parent.parent
+        pkg_dir = Path(_moshi_pkg.__path__[0]).parent
+
+        #pkg_dir = Path(importlib.util.find_spec("moshi").origin).parent.parent.parent  # type: ignore
         config_file = pkg_dir / config_path
     with open(config_file) as f:
         lm_kwargs = json.load(f)

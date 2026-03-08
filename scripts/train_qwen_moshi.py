@@ -470,6 +470,10 @@ def main():
     )
     model.train()
 
+    for name, p in model.named_parameters():
+        if "emb" in name.lower():
+            print(name, p.shape)
+
     if args.freeze_backbone:
         freeze_backbone(model)
 
