@@ -11,8 +11,20 @@ Key design decisions (lessons learned from previous attempts):
   - First codebook weight defaults to 100 (matching official moshi-finetune).
   - Backbone LR default is 5e-5 (not 1e-5) so the backbone actually adapts.
 
-Phase 1 (warm up Depformer, frozen backbone)::
+Phase 0 (embedding warmup, trains audio embeddings + depformer only)::
 
+    python scripts/train_qwen_moshi.py \
+        --qwen-weights qwen_7b_moshi_format.safetensors \
+        --data-dir ./encoded_codes_all \
+        --epochs 20 --batch-size 8 --seq-length 256 \
+        --grad-accum 4 --lr 3e-4 --warmup-steps 200 \
+        --freeze-backbone --embed-warmup-steps 500 \
+        --out-dir runs/phase0_phase1 \
+        --eval-every 250 --eval-sample 36000
+
+Phase 1 (warm up Depformer, frozen backbone — runs automatically after Phase 0)::
+
+    # If running separately without Phase 0:
     python scripts/train_qwen_moshi.py \
         --qwen-weights qwen_7b_moshi_format.safetensors \
         --data-dir ./encoded_codes_all \
@@ -24,7 +36,7 @@ Phase 1 (warm up Depformer, frozen backbone)::
 Phase 2 (joint training with noise injection)::
 
     python scripts/train_qwen_moshi.py \
-        --qwen-weights runs/phase1/checkpoint_final.safetensors \
+        --qwen-weights runs/phase0_phase1/checkpoint_final.safetensors \
         --data-dir ./encoded_codes_all \
         --epochs 50 --batch-size 4 --seq-length 256 \
         --grad-accum 8 --lr 3e-4 --backbone-lr 5e-5 \
@@ -90,6 +102,10 @@ def parse_args():
     p.add_argument("--backbone-lr", type=float, default=0.0,
                    help="Separate LR for backbone (0 = use --lr for everything). "
                         "Recommended: 5e-5 for Phase 2.")
+    p.add_argument("--embed-warmup-steps", type=int, default=0,
+                   help="Phase 0: train only audio embeddings + depformer for N steps "
+                        "before switching to the main freeze mode. "
+                        "Recommended: 300-500 steps. 0 = skip Phase 0.")
 
     # Loss weighting (matching official moshi-finetune)
     p.add_argument("--first-codebook-weight", type=float, default=100.0,
@@ -396,12 +412,75 @@ def run_eval(model, eval_codes, step_num, out_dir, mimi, tokenizer,
         model.train()
 
 
+# ---- Freeze functions ----
+
+def freeze_for_phase0(model: torch.nn.Module) -> None:
+    """Phase 0: freeze everything EXCEPT audio embeddings + depformer + audio heads.
+
+    This teaches the backbone what audio tokens mean in its embedding
+    space before we train the Depformer to rely on those representations.
+
+    Unfrozen:
+      - emb.0 - emb.15          (backbone audio codebook embeddings)
+      - depformer*               (depformer everything)
+      - linears.*                (audio output projections)
+
+    Frozen:
+      - transformer.*            (backbone transformer layers)
+      - text_emb.*               (backbone text embedding - already good from Qwen)
+      - text_linear.*            (backbone text output projection)
+      - out_norm.*               (backbone output norm)
+    """
+    # First freeze everything
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Then selectively unfreeze
+    unfrozen_names = []
+
+    for name, param in model.named_parameters():
+        should_unfreeze = False
+
+        # Audio embeddings for the backbone (emb.0 through emb.15)
+        if name.startswith("emb.") and not name.startswith("emb_"):
+            should_unfreeze = True
+
+        # All depformer parameters
+        if name.startswith("depformer"):
+            should_unfreeze = True
+
+        # Audio output linear projections
+        if name.startswith("linears."):
+            should_unfreeze = True
+
+        if should_unfreeze:
+            param.requires_grad = True
+            unfrozen_names.append(name)
+
+    unfrozen_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_count = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    print(f"  Phase 0 freeze: {unfrozen_count / 1e6:.1f}M unfrozen, "
+          f"{frozen_count / 1e6:.1f}M frozen")
+    print(f"  Unfrozen groups: audio emb ({sum(1 for n in unfrozen_names if n.startswith('emb.'))}), "
+          f"depformer ({sum(1 for n in unfrozen_names if n.startswith('depformer'))}), "
+          f"linears ({sum(1 for n in unfrozen_names if n.startswith('linears.'))})")
+
+
 def freeze_backbone(model: torch.nn.Module) -> None:
     """Freeze the temporal transformer backbone and text embedding/projection."""
     for name, param in model.named_parameters():
         if any(name.startswith(pfx) for pfx in
                ("transformer.", "text_emb.", "text_linear.", "out_norm.")):
             param.requires_grad = False
+
+
+def apply_freeze_mode(model, args, phase0_active):
+    """Apply the correct freeze mode based on current training phase."""
+    if phase0_active:
+        freeze_for_phase0(model)
+    elif args.freeze_backbone:
+        freeze_backbone(model)
+    # else: everything unfrozen (Phase 2 / joint training)
 
 
 def build_optimizer(model, args, backbone_prefixes):
@@ -439,8 +518,10 @@ def build_optimizer(model, args, backbone_prefixes):
         print(f"  Differential LR: backbone ({n_bb / 1e6:.0f}M) @ {args.backbone_lr}, "
               f"Depformer+audio ({n_other / 1e6:.0f}M) @ {args.lr}")
 
+    n_trainable = sum(p.numel() for g in groups for p in g["params"])
     n_wd = sum(p.numel() for p in decay_params + backbone_decay)
     n_no_wd = sum(p.numel() for p in no_decay_params + backbone_no_decay)
+    print(f"  Optimizer: {n_trainable / 1e6:.1f}M trainable params")
     print(f"  Weight decay: {n_wd / 1e6:.0f}M params with wd={args.weight_decay}, "
           f"{n_no_wd / 1e6:.0f}M without")
 
@@ -449,7 +530,7 @@ def build_optimizer(model, args, backbone_prefixes):
 
 def main():
     args = parse_args()
-    config_path = args.config or str(REPO_ROOT / "configs" / "moshi_qwen_7b.json")
+    config_path = args.config or str(REPO_ROOT / "configs" / "moshi_qwen_3b.json")
     device = torch.device(args.device)
 
     print("=" * 70)
@@ -470,17 +551,21 @@ def main():
     )
     model.train()
 
-    for name, p in model.named_parameters():
-        if "emb" in name.lower():
-            print(name, p.shape)
-
-    if args.freeze_backbone:
+    # ---- Apply freeze mode ----
+    phase0_active = args.embed_warmup_steps > 0
+    if phase0_active:
+        print(f"\nPhase 0: Embedding warmup for {args.embed_warmup_steps} steps")
+        freeze_for_phase0(model)
+    elif args.freeze_backbone:
+        print("\nPhase 1: Backbone frozen")
         freeze_backbone(model)
 
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
+    phase_str = "Phase 0 (embed warmup)" if phase0_active else \
+                ("backbone frozen" if args.freeze_backbone else "all unfrozen")
     print(f"Parameters: {n_trainable / 1e6:.1f}M trainable / {n_total / 1e6:.1f}M total"
-          + (" (backbone frozen)" if args.freeze_backbone else ""))
+          f" ({phase_str})")
 
     # ---- Optimizer ----
     backbone_prefixes = ("transformer.", "text_emb.", "text_linear.", "out_norm.")
@@ -489,6 +574,10 @@ def main():
     # ---- Data ----
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save config alongside checkpoints for reproducibility
+    import shutil
+    shutil.copy2(config_path, out_dir / "model_config.json")
 
     data_dir_or_dirs = args.data_dirs if args.data_dirs else args.data_dir
     if not args.synthetic and data_dir_or_dirs is None:
@@ -511,8 +600,10 @@ def main():
         if args.steps > 0:
             total_steps = min(total_steps, args.steps)
         eff_batch = args.batch_size * args.grad_accum
+        n_dropped = len(dataset) - batches_per_epoch * args.batch_size
         print(
-            f"\nReal data: {len(dataset)} samples, {batches_per_epoch} batches/epoch\n"
+            f"\nReal data: {len(dataset)} samples, {batches_per_epoch} batches/epoch"
+            f" ({n_dropped} samples dropped per epoch)\n"
             f"Effective batch size: {args.batch_size} x {args.grad_accum} accum = {eff_batch}\n"
             f"Steps/epoch: {steps_per_epoch}, Total steps: {total_steps}, Epochs: {args.epochs}\n"
             f"LR: warmup {args.warmup_steps} -> peak {args.lr} -> cosine to {args.min_lr}"
@@ -521,13 +612,24 @@ def main():
     # ---- Resume ----
     start_step = 0
     start_epoch = 1
+    best_loss = float("inf")
     if args.resume:
         print(f"\nResuming from {args.resume}...")
         state = torch.load(args.resume, map_location="cpu", weights_only=True)
         opt.load_state_dict(state["optimizer"])
         start_step = state["step"]
         start_epoch = state.get("epoch", 1)
-        print(f"  Resumed at step {start_step}, epoch {start_epoch}")
+        best_loss = state.get("best_loss", float("inf"))
+        # If resuming past Phase 0, deactivate it
+        if phase0_active and start_step >= args.embed_warmup_steps:
+            print(f"  Resumed past Phase 0 ({start_step} >= {args.embed_warmup_steps})")
+            phase0_active = False
+            if args.freeze_backbone:
+                for param in model.parameters():
+                    param.requires_grad = True
+                freeze_backbone(model)
+                opt, use_differential_lr = build_optimizer(model, args, backbone_prefixes)
+        print(f"  Resumed at step {start_step}, epoch {start_epoch}, best_loss {best_loss:.4f}")
 
     # ---- Eval setup ----
     mimi = None
@@ -552,9 +654,7 @@ def main():
 
     # ---- Training loop ----
     step = start_step
-    best_loss = float("inf")
     t0 = time.time()
-    accum_losses = {"total": 0.0, "text": 0.0, "audio": 0.0, "count": 0}
     log_losses = {"total": 0.0, "text": 0.0, "audio": 0.0, "count": 0}
 
     def log_step(step_num, loss_t, loss_text, loss_audio, grad_norm, epoch=None):
@@ -572,8 +672,9 @@ def main():
             elapsed = time.time() - t0
             current_lr = get_lr(step_num, args.warmup_steps, total_steps, args.lr, args.min_lr)
             ep_str = f"ep {epoch:3d}  " if epoch is not None else ""
+            phase_tag = "[P0] " if phase0_active else ""
             print(
-                f"  {ep_str}step {step_num:6d}/{total_steps}  "
+                f"  {phase_tag}{ep_str}step {step_num:6d}/{total_steps}  "
                 f"loss {avg_t:.4f} (text {avg_text:.4f} + audio {avg_audio:.4f})  "
                 f"gnorm {grad_norm:.3f}  lr {current_lr:.2e}  dt {elapsed:.1f}s"
             )
@@ -595,6 +696,7 @@ def main():
             "step": step_num,
             "epoch": epoch,
             "optimizer": opt.state_dict(),
+            "best_loss": best_loss,
         }, str(state_path))
 
     def update_lr(step_num):
@@ -604,9 +706,41 @@ def main():
                 pg["lr"] = get_lr(step_num, args.warmup_steps, total_steps,
                                   args.backbone_lr, min_bb_lr)
             else:
-                base_lr = args.backbone_lr if pg.get("label") == "backbone" else args.lr
                 pg["lr"] = get_lr(step_num, args.warmup_steps, total_steps,
-                                  base_lr, args.min_lr)
+                                  args.lr, args.min_lr)
+
+    def maybe_transition_from_phase0(step_num, epoch):
+        """Check if Phase 0 is done and switch to Phase 1."""
+        nonlocal phase0_active, opt, use_differential_lr
+        if not phase0_active:
+            return
+        if step_num < args.embed_warmup_steps:
+            return
+
+        print(f"\n{'=' * 70}")
+        print(f"  PHASE 0 COMPLETE at step {step_num}")
+        print(f"  Transitioning to {'Phase 1 (backbone frozen)' if args.freeze_backbone else 'joint training'}...")
+        print(f"{'=' * 70}")
+
+        # Save Phase 0 checkpoint
+        save_checkpoint(step_num, tag="phase0_done")
+
+        # Switch freeze mode
+        phase0_active = False
+
+        # Unfreeze everything first, then apply target freeze
+        for param in model.parameters():
+            param.requires_grad = True
+
+        if args.freeze_backbone:
+            freeze_backbone(model)
+
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  Now trainable: {n_trainable / 1e6:.1f}M parameters")
+
+        # Rebuild optimizer for new param groups
+        opt, use_differential_lr = build_optimizer(model, args, backbone_prefixes)
+        print()
 
     print(f"\nStarting training...\n")
 
@@ -629,6 +763,7 @@ def main():
             opt.zero_grad()
             step += 1
             log_step(step, loss.item(), text_loss.item(), audio_loss.item(), grad_norm)
+            maybe_transition_from_phase0(step, 0)
             if args.save_every and step % args.save_every == 0:
                 save_checkpoint(step)
     else:
@@ -684,6 +819,9 @@ def main():
                     )
                     accum_losses = {"total": 0.0, "text": 0.0, "audio": 0.0, "count": 0}
 
+                    # Phase 0 -> Phase 1 transition
+                    maybe_transition_from_phase0(step, epoch)
+
                     if args.save_every and step % args.save_every == 0:
                         save_checkpoint(step)
                         save_training_state(step, epoch)
@@ -695,7 +833,7 @@ def main():
                         break
 
             avg_epoch_loss = epoch_loss / max(micro_step, 1)
-            print(f"  Epoch {epoch} complete. Avg loss: {avg_epoch_loss:.4f} "
+            print(f"  Epoch {epoch} complete. Avg micro-step loss: {avg_epoch_loss:.4f} "
                   f"({epoch_steps} optimizer steps)\n")
             save_checkpoint(step, tag=f"epoch_{epoch}")
             save_training_state(step, epoch)

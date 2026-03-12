@@ -38,7 +38,7 @@ Output structure (added to each dialogue directory)::
         turn_00.wav
         ...
 """
-
+import random
 import argparse
 import json
 import os
@@ -69,7 +69,6 @@ def init_cosyvoice(cosyvoice_dir: str, hf_token: str | None = None):
     matcha_path = os.path.join(cosyvoice_dir, "third_party", "Matcha-TTS")
     if matcha_path not in sys.path:
         sys.path.insert(0, matcha_path)
-
     from huggingface_hub import snapshot_download
     from cosyvoice.cli.cosyvoice import AutoModel
 
@@ -105,12 +104,17 @@ def synthesize_turn(model, text: str, speaker_id: str, seed: int = 1986) -> tupl
     Returns:
         (audio, sample_rate): audio is a 1D numpy float32 array.
     """
-    set_seeds(seed)
 
     # Text preprocessing (matches gradio_ui.py)
     processed_text = text.replace("\u2019", "'")
     processed_text = re.sub(r"\s{2,}", " ", processed_text).strip()
-    processed_text = f"You are a helpfull assistant.<|endofprompt|>{processed_text}"
+
+    emotions = ['tender', 'grateful', 'affectionate', 'annoyed', 'supportive', 'curious', 'cheerful', 'whispering', 'passionate', 'neutral']
+    emo_choice = random.choices(emotions, weights=[1, 1, 1, 1, 1, 1, 1, 1, 1, 3], k=1)[0]
+    if emo_choice == 'neutral':
+        processed_text = f"You are a helpfull assistant.<|endofprompt|>{processed_text}"
+    else:
+        processed_text = f"You are a helpfull assistant. Speak {emo_choice}.<|endofprompt|>{processed_text}"
 
     outputs = list(model.inference_sft(processed_text, speaker_id, stream=False))
     audio = outputs[0]["tts_speech"].numpy().flatten().astype(np.float32)
@@ -149,7 +153,6 @@ def main():
          if d.is_dir() and (d / "dialogue.json").exists()],
         key=lambda d: d.name,
     )
-
     if args.end_idx > 0:
         dialogue_dirs = dialogue_dirs[args.start_idx:args.end_idx]
     elif args.start_idx > 0:
@@ -186,6 +189,10 @@ def main():
 
             role = turn["role"]
             speaker_id = speakers[role]["id"]
+            if speaker_id == 'Speaker_Natalie':
+                speaker_id = 'Speaker_Despina'
+            if speaker_id == 'Speaker_Laomodeia':
+                speaker_id = 'Speaker_Honey'
             text = turn["text"]
 
             try:
